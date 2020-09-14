@@ -6,38 +6,8 @@ import * as sysPath from 'path';
 import { guessMaxArity } from 'guess-function-max-arity';
 import { rollup, watch } from 'rollup';
 
+import { tapThen, type } from './utils';
 export { version as VERSION } from '../package.json';
-
-function type(value) {
-  const t = typeof value;
-  switch (t) {
-    case 'string':
-    case 'boolean':
-    case 'undefined':
-    case 'number':
-    case 'bigint':
-    case 'symbol':
-    case 'function':
-      return t;
-    default:
-      throw new Error('unknown type');
-    case 'object':
-  }
-
-  switch (toString.call(value)) {
-    case '[object Null]':
-      return 'null';
-    case '[object Date]':
-      return 'date';
-    case '[object Array]':
-      return 'array';
-    case '[object Error]':
-      return 'error';
-    case '[object Promise]':
-      return 'promise';
-  }
-  return 'object';
-}
 
 function* identify(input, t = type(input)) {
   switch (t) {
@@ -58,9 +28,6 @@ function* identify(input, t = type(input)) {
       throw new TypeError(`unsupported input field: ${t}`);
   }
 }
-
-const then = (value, fn) => (type(value) === 'promise' ? value.then(fn) : fn(value));
-const tapThen = (value, fn) => then(value, (v) => (fn(v), v));
 
 const cacheLoads = (plugins, cache = Object.create(null)) => ({
   plugins: [
@@ -90,31 +57,65 @@ const cacheLoads = (plugins, cache = Object.create(null)) => ({
 // TODO: support assets
 const getChunk = ({ output: outputs }) => outputs.find(({ type }) => type === 'chunk');
 
-function firstKey(obj) {
+function* keys(obj) {
   for (const key in obj) {
     if (hasOwnProperty.call(obj, key)) {
-      return key;
+      yield key;
     }
   }
 }
 
-async function build({ input, plugins, cache: { load: cacheLoad = true } = {}, ...inputOptions }) {
+function* entries(obj) {
+  for (const key in obj) {
+    if (hasOwnProperty.call(obj, key)) {
+      yield [key, obj[key]];
+    }
+  }
+}
+
+// Truncates the given iterable.
+function first(iter, fallback) {
+  for (const value of iter) {
+    return value;
+  }
+  return fallback;
+}
+
+const getName = (value) =>
+  typeof inputValue === 'string' ? sysPath.parse(value).name : first(keys(value));
+
+const interpretInput = (value) =>
+  typeof inputValue === 'string' ? [sysPath.parse(value).name, value] : first(entries(value));
+
+// TODO: support different output formats etc per input.
+async function* build({ input, plugins, cache: { load: cacheLoad = true } = {}, ...inputOptions }) {
   const inputType = type(input);
 
+  // TODO: detect one target in other ways
   if (inputType === 'string') {
-    return rollup({ input, ...inputOptions }).then(({ cache: next, ...bundle }) => ({
+    const name = getName(input);
+    yield rollup({
+      input,
+      plugins: plugins.map((plugin) =>
+        typeof plugin === 'function' ? plugin(name, input) : plugin
+      ),
+      cache: false,
+      ...inputOptions,
+    }).then(({ cache: next, ...bundle }) => ({
       ...bundle,
       generate: (...options) => bundle.generate(...options).then(getChunk),
       // TODO: write
     }));
+    return;
   }
 
-  const multiPlugins = cacheLoad ? cacheLoads(plugins).plugins : plugins;
+  const pluginVariance = plugins.some((plugin) => typeof plugin === 'function');
+  // TODO: exclude well-known plugins like node-resolve?
+  // const resolutionMayVary =
+  //   pluginVariance ||
+  //   multiPlugins.some((plugin) => plugin.resolveId && guessMaxArity(plugin.resolveId) > 1);
 
-  const pluginVariance = multiPlugins.some((plugin) => typeof plugin === 'function');
-  const resolutionMayVary =
-    pluginVariance ||
-    multiPlugins.some((plugin) => plugin.resolveId && guessMaxArity(plugin.resolveId) > 1);
+  const multiPlugins = cacheLoad ? cacheLoads(plugins).plugins : plugins;
 
   // Elide modules that vary.
   let cache; /*{
@@ -122,10 +123,9 @@ async function build({ input, plugins, cache: { load: cacheLoad = true } = {}, .
     plugins: Object.create(null),
   };*/
 
-  const bundles = [];
   for (const inputValue of identify(input, inputType)) {
-    const inputName =
-      typeof inputValue === 'string' ? sysPath.parse(inputValue).name : firstKey(inputValue);
+    const [name, entry] = interpretInput(inputValue),
+      start = process.hrtime.bigint();
     const { cache: updatedCache, ...bundle } = await rollup({
       ...inputOptions,
       plugins: pluginVariance
@@ -133,31 +133,31 @@ async function build({ input, plugins, cache: { load: cacheLoad = true } = {}, .
             // TODO: what do we capture here?
             // how to handle e.g. modules resolved by a plugin in one case and skipped in another?
             // maybe after the last plugin that varies we can jump straight to a cache?
-            typeof plugin === 'function' ? plugin(inputName, inputValue) : plugin
+            typeof plugin === 'function' ? plugin(name, inputValue) : plugin
           )
         : multiPlugins,
       input: inputValue,
       cache,
     });
-    bundles[bundles.length] = bundle;
+    yield {
+      ...bundle,
+      name,
+      entrypoint: entry,
+      generate: (outputOptions) => bundle.generate(outputOptions).then(getChunk),
+      write: (outputOptions) => bundle.write(outputOptions).then(getChunk),
+      stats: {
+        duration: Number((process.hrtime.bigint() - start) / 1000000n),
+      },
+    };
     cache = updatedCache;
+    // for (const module of cache.modules) {
+    //   module.resolvedIds = Object.create(null);
+    // }
   }
-
-  return {
-    // TODO: perf?
-    async generate(outputOptions) {
-      const results = await Promise.all(
-        bundles.map((bundle) => bundle.generate(outputOptions).then(getChunk))
-      );
-      return inputType === 'array'
-        ? results
-        : Object.fromEntries(results.map((result, i) => [input[i], result]));
-    },
-  };
 }
 
 export function watchBuild(config) {
-  // Need to track which modules are included by which entry points.
+  // Need to track which modules are included by which entry points. See watchFiles?
 }
 
 export { build as rollup, watchBuild as watch };

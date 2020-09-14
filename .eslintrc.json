@@ -2,5 +2,11 @@
   "extends": ["mixmax/node/withJest", "mixmax/prettier"],
   "parserOptions": {
     "sourceType": "module"
-  }
+  },
+  "overrides": [
+    {
+      "files": ["src/cli.js"],
+      "rules": { "no-console": "off" }
+    }
+  ]
 }
